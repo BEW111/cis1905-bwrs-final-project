@@ -1,14 +1,79 @@
 use actix_web::{get, web, App, HttpResponse, HttpServer, Responder};
+use anyhow::{Context, Result};
+use fastembed::{EmbeddingModel, InitOptions, TextEmbedding};
+use num_traits::{Float, Num, NumCast};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, map::Map, Value};
-use std::collections::HashMap;
-use std::sync::Mutex;
-use num_traits::{Float, Num, NumCast};
+
 use std::ops::{Add, Mul};
-use fastembed::{TextEmbedding, InitOptions, EmbeddingModel};
-use anyhow::{Result, Context};
+use std::sync::Mutex;
 
+use std::collections::hash_map::Entry;
+use std::collections::HashMap;
 
+use rand::prelude::*;
+use rand_distr::Uniform;
+use std::f64::consts::E;
+
+#[derive(Clone)]
+struct GraphLayer {
+    pub entry: Option<u32>,
+    pub adjacency: HashMap<u32, Vec<u32>>, // map from node id to list of adjacent node ids
+}
+
+impl GraphLayer {
+    fn new(entry: Option<u32>) -> Self {
+        GraphLayer {
+            entry,
+            adjacency: HashMap::new(),
+        }
+    }
+
+    pub fn set_entry_node(&mut self, entry: u32) -> Result<()> {
+        self.entry = Some(entry);
+
+        Ok(())
+    }
+
+    pub fn add_node(&mut self, node_id: u32) -> Result<()> {
+        if let Entry::Vacant(entry) = self.adjacency.entry(node_id) {
+            let neighbors: Vec<u32> = Vec::new();
+            entry.insert(neighbors);
+        }
+
+        Ok(())
+    }
+
+    pub fn add_neighbor(&mut self, node_id: u32, neighbor_id: u32) -> Result<()> {
+        if self.adjacency.contains_key(&node_id) {
+            if !self
+                .adjacency
+                .get_mut(&node_id)
+                .unwrap()
+                .contains(&neighbor_id)
+            {
+                self.adjacency.get_mut(&node_id).unwrap().push(neighbor_id);
+            }
+        } else {
+            self.adjacency.insert(node_id, vec![neighbor_id]);
+        }
+
+        if self.adjacency.contains_key(&neighbor_id) {
+            if (!self
+                .adjacency
+                .get_mut(&neighbor_id)
+                .unwrap()
+                .contains(&node_id))
+            {
+                self.adjacency.get_mut(&neighbor_id).unwrap().push(node_id);
+            }
+        } else {
+            self.adjacency.insert(neighbor_id, vec![node_id]);
+        }
+
+        Ok(())
+    }
+}
 
 #[derive(Serialize, Deserialize, Debug)]
 struct Document {
@@ -20,6 +85,8 @@ struct Document {
 struct Database {
     documents: HashMap<u32, Document>,
     next_id: u32, // keeps track of the id for the document that would be added next
+    num_layers: usize,
+    graph_layers: Vec<GraphLayer>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -30,7 +97,7 @@ struct SearchQuery {
 
 #[derive(Serialize, Deserialize)]
 struct UploadQuery {
-    content: String
+    content: String,
 }
 
 // If a type implements this trait, it can be compared with another type
@@ -89,40 +156,172 @@ fn cosine_similarity(a: &Vec<f32>, b: &Vec<f32>) -> f32 {
 
 fn generate_embedding(document_content: &str) -> Result<Vec<f32>, anyhow::Error> {
     // Call to external API to generate embedding
-    let mut model = TextEmbedding::try_new(InitOptions {
+    let model = TextEmbedding::try_new(InitOptions {
         model_name: EmbeddingModel::AllMiniLML6V2,
         show_download_progress: true,
         ..Default::default()
     })?;
 
-    let embedding = model.embed(vec![document_content], None)?; 
+    let embedding = model.embed(vec![document_content], None)?;
 
-   Ok(embedding[0].clone())
+    Ok(embedding[0].clone())
 }
 
 impl Database {
+    fn new(num_layers: usize) -> Self {
+        let mut graphs: Vec<GraphLayer> = Vec::new();
+        for _ in 0..num_layers {
+            graphs.push(GraphLayer::new(None));
+        }
+
+        Database {
+            documents: HashMap::new(),
+            next_id: 0,
+            num_layers: num_layers,
+            graph_layers: graphs,
+        }
+    }
+
+    fn generate_level(&mut self, assign_probas: &[f64], rng: &mut ThreadRng) -> usize {
+        // Create a uniform distribution from 0.0 to 1.0
+        let between = Uniform::from(0.0..1.0);
+        let f = rng.sample(between);
+        let mut cumulative_probability = 0.0;
+
+        for (level, &probability) in assign_probas.iter().enumerate() {
+            cumulative_probability += probability;
+            if f < cumulative_probability {
+                return level;
+            }
+        }
+
+        // Return the last level in the unlikely event that none are selected
+        assign_probas.len() - 1
+    }
+
+    fn set_assign_probas(&mut self, m: usize, m_l: f64) -> (Vec<f64>, Vec<usize>) {
+        let mut nn = 0; // Set nearest neighbors count = 0
+        let mut cum_nneighbor_per_level = Vec::new();
+        let mut level = 0; // We start at level 0
+        let mut assign_probas = Vec::new();
+
+        loop {
+            let proba = E.powf(-(level as f64) / m_l) * (1.0 - E.powf(-1.0 / m_l));
+            // Once we reach low prob threshold, we've created enough levels
+            if proba < 1e-9 {
+                break;
+            }
+            assign_probas.push(proba);
+
+            // Calculate the number of neighbors for this level
+            nn += (2 - level / (self.num_layers - 1)) * m;
+            cum_nneighbor_per_level.push(nn);
+            level += 1;
+        }
+        (assign_probas, cum_nneighbor_per_level)
+    }
+
     // Inserts a new document into the database, given the string content and the embedding
     fn insert(&mut self, content: String, embedding: Vec<f32>) -> u32 {
+        let doc_id = self.next_id;
+
+        // New document to be inserted
         let doc = Document {
-            id: self.next_id,
+            id: doc_id,
             content,
-            embedding,
+            embedding: embedding.clone(),
         };
+
+        // For each layer from here to 0, we'll find the M nearest neighbors and add links
+        //let (assign_probas, cum_nneighbor_per_level) = self.set_assign_probas(3, 0.07);
+
+        let assign_probas = vec![0.5, 0.3, 0.15, 0.05];
+        let cun_nneighbor_per_level = vec![4, 3, 2, 1];
+        let mut rng = rand::thread_rng();
+
+        let mut l = self.generate_level(&assign_probas, &mut rng); // highest level to insert this node at
+        let graph_is_empty = self.documents.len() == 0;
+        if graph_is_empty {
+            // this node must be inserted at the top level if nothing is in the graph yet
+            l = self.num_layers - 1;
+
+            // make it the entrypoint
+            let top_layer = self.graph_layers.get_mut(l).unwrap();
+            match top_layer.set_entry_node(doc_id) {
+                Ok(_) => (),
+                Err(e) => println!("Error setting: {}", e),
+            };
+        }
+        println!("node will be inserted at layer {:?}", l);
+
+        for curr_layer in 0..(l + 1) {
+            let m = cun_nneighbor_per_level[curr_layer]; // number of neighbors to connect to
+            println!("Number of links in layer {:?}: {:?}", curr_layer, m);
+
+            if let Some(curr_graph) = self.graph_layers.get_mut(curr_layer) {
+                // Add the node to this graph
+                match curr_graph.add_node(doc_id) {
+                    Ok(_) => (),
+                    Err(e) => println!("Error adding neighbor: {}", e),
+                };
+
+                let embedding_clone = embedding.clone();
+                let graph_clone = curr_graph.clone();
+                // Find the M nearest neighbors, and add all of these edges
+                let mut all_doc_similarities: Vec<(&u32, f32)> = graph_clone
+                    .adjacency
+                    .keys()
+                    .map(|other_doc_id| {
+                        if let Some(other_doc) = self.documents.get(other_doc_id) {
+                            let other_embedding = &other_doc.embedding;
+                            Some((other_doc_id, embedding_clone.similarity(other_embedding)))
+                        } else {
+                            None
+                        }
+                    })
+                    .flatten() // filter out None values
+                    .collect();
+
+                // Sort similarities
+                all_doc_similarities
+                    .sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+
+                // Get the top m
+                let top_m_docs: Vec<&u32> = all_doc_similarities
+                    .into_iter()
+                    .take(m)
+                    .map(|(doc, _)| doc)
+                    .collect();
+
+                for new_neighbor_id in top_m_docs {
+                    println!(
+                        "Adding link from node {:?} to node {:?}",
+                        doc_id, new_neighbor_id
+                    );
+                    match curr_graph.add_neighbor(doc_id, *new_neighbor_id) {
+                        Ok(_) => (),
+                        Err(e) => println!("Error adding neighbor: {}", e),
+                    }
+                }
+            }
+        }
+
+        // Record the document
         self.documents.insert(self.next_id, doc);
         self.next_id += 1;
         self.next_id - 1
     }
 
-    // Given a query embedding, finds the document nearest to this
-    fn search(&self, query: &str, top_k: usize) -> Option<Vec<&Document>> {
+    fn search(&mut self, query: &str, top_k: usize) -> Option<&Document> {
+        println!("Query is {:?}", query);
         let query_embedding_result = generate_embedding(query);
-        let mut query_embedding : Vec<f32> = Vec::new();
+        let mut query_embedding: Vec<f32> = Vec::new();
 
         match query_embedding_result {
             Ok(ref embedding) => {
                 query_embedding = embedding.clone();
                 // Do something with the similarity
-            },
+            }
             Err(e) => {
                 // Handle the error, e.g., logging or setting a default value
                 println!("Failed to calculate embedding: {}", e);
@@ -133,29 +332,81 @@ impl Database {
             return None;
         }
 
-        println!("Searching for query: {:?}", query);
-        
-        let mut all_doc_similarites : Vec<(&Document, f32)> = self.documents.values().map(|doc| {
-            let similarity = doc.embedding.similarity(&query_embedding);
-            (doc, similarity)
-        }).collect();
+        let mut curr_entry_node: u32 = u32::MAX;
+        let mut curr_node: u32 = u32::MAX;
 
-        all_doc_similarites.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-        let top_k_docs : Vec<&Document> = all_doc_similarites.into_iter().take(top_k).map(|(doc, _)| doc).collect();
+        for curr_layer in (0..self.num_layers).rev() {
+            println!("Currently at layer {:?}", curr_layer);
+            let curr_graph = self.graph_layers.get(curr_layer).unwrap();
 
-        println!("Results: {:?}", top_k_docs);
+            if let Some(entry) = curr_graph.entry {
+                curr_entry_node = entry;
+            }
 
-        if top_k_docs.is_empty() {
-            None
-        } else {
-            Some(top_k_docs)
+            curr_node = curr_entry_node;
+            println!("Starting search at node {:?}", curr_node);
+            let mut best_similarity: f32 = 0.0_f32;
+
+            loop {
+                // 1. get all neighbors of this current node
+                // 2. compare the vector embedding of the doc to be inserted
+                //    against all neighbors
+                let mut neighbor_similarities: Vec<(&u32, f32)> = curr_graph
+                    .adjacency
+                    .get(&curr_node)
+                    .unwrap()
+                    .iter()
+                    .map(|doc_id| {
+                        let doc = self.documents.get(doc_id).unwrap();
+                        let similarity = doc.embedding.similarity(&query_embedding);
+                        println!(
+                            "Similarity between query and doc {:?} is {:?}",
+                            doc.content, similarity
+                        );
+                        (doc_id, similarity)
+                    })
+                    .collect();
+
+                neighbor_similarities
+                    .sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+
+                if neighbor_similarities.len() == 0 {
+                    curr_entry_node = curr_node;
+                    println!(
+                        "node {:?} is the best for this layer, moving down",
+                        curr_node
+                    );
+                    break;
+                }
+
+                // if none of the neighbor similarities are higher than
+                // best similarity, then drop down to the next layer
+                if neighbor_similarities[0].1 <= best_similarity {
+                    curr_entry_node = curr_node;
+                    println!(
+                        "node {:?} is the best for this layer, moving down",
+                        curr_node
+                    );
+                    break;
+                }
+
+                // otherwise, set current node to the neighbor with the best similarity
+                if neighbor_similarities[0].1 > best_similarity {
+                    curr_node = *neighbor_similarities[0].0;
+                    best_similarity = neighbor_similarities[0].1;
+                }
+            }
         }
+
+        // at this point, we're at some current node with the document id we want,
+        // so we can simply return the corresponding document
+        self.documents.get(&curr_node)
     }
 }
 
 #[actix_web::main]
 async fn main() -> std::io::Result<()> {
-    let data = web::Data::new(Mutex::new(Database { documents: HashMap::new(), next_id: 0 }));
+    let data = web::Data::new(Mutex::new(Database::new(4)));
     HttpServer::new(move || {
         App::new()
             .app_data(data.clone())
@@ -173,12 +424,15 @@ async fn hello() -> impl Responder {
     HttpResponse::Ok().body("Hello world!")
 }
 
-async fn upload_document(data: web::Data<Mutex<Database>>, json: web::Json<UploadQuery>) -> impl Responder {
+async fn upload_document(
+    data: web::Data<Mutex<Database>>,
+    json: web::Json<UploadQuery>,
+) -> impl Responder {
     println!("got upload_document");
     let mut db = data.lock().unwrap(); // Accessing the database safely
-    // Assume generate_embedding is synchronous just for placeholder; you'd use .await for async
+                                       // Assume generate_embedding is synchronous just for placeholder; you'd use .await for async
     let json_embedding = generate_embedding(&json.content);
-    let mut content_embedding : Vec<f32> = Vec::new();
+    let mut content_embedding: Vec<f32> = Vec::new();
 
     // let mut doc_id = 0;
     // if let Ok(embedding) = generate_embedding(&json.content) {
@@ -193,7 +447,7 @@ async fn upload_document(data: web::Data<Mutex<Database>>, json: web::Json<Uploa
     match json_embedding {
         Ok(ref embedding) => {
             content_embedding = embedding.clone();
-        },
+        }
         Err(e) => {
             // Handle the error, e.g., logging or setting a default value
             println!("Failed to calculate embedding: {}", e);
@@ -219,10 +473,13 @@ fn doc_vec_to_json(doc_list: Vec<&Document>) -> Value {
     Value::Object(json_map)
 }
 
-async fn search_document(data: web::Data<Mutex<Database>>, json: web::Json<SearchQuery>) -> impl Responder {
-    let db = data.lock().unwrap();
-    if let Some(docs) = db.search(&json.query.clone(), json.top_k.clone()) {
-        HttpResponse::Ok().json(doc_vec_to_json(docs))
+async fn search_document(
+    data: web::Data<Mutex<Database>>,
+    json: web::Json<SearchQuery>,
+) -> impl Responder {
+    let mut db = data.lock().unwrap();
+    if let Some(doc) = db.search(&json.query.clone(), json.top_k.clone()) {
+        HttpResponse::Ok().json(json! ({"id": doc.id, "content": doc.content}))
     } else {
         HttpResponse::NotFound().finish()
     }
