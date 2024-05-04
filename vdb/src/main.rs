@@ -36,7 +36,10 @@ impl PartialOrd for MinNonNan {
 
 impl Ord for MinNonNan {
     fn cmp(&self, other: &MinNonNan) -> Ordering {
-        self.partial_cmp(other).unwrap()
+        match self.partial_cmp(other) {
+            Some(ord) => ord,
+            None => Ordering::Less,
+        }
     }
 }
 
@@ -72,26 +75,30 @@ impl GraphLayer {
 
     pub fn add_neighbor(&mut self, node_id: u32, neighbor_id: u32) -> Result<()> {
         if self.adjacency.contains_key(&node_id) {
-            if !self
-                .adjacency
-                .get_mut(&node_id)
-                .unwrap()
-                .contains(&neighbor_id)
-            {
-                self.adjacency.get_mut(&node_id).unwrap().push(neighbor_id);
+            match self.adjacency.get_mut(&node_id) {
+                Some(neighbors) => {
+                    if !neighbors.contains(&neighbor_id) {
+                        neighbors.push(neighbor_id);
+                    }
+                }
+                None => {
+                    println!("Error getting neighbors for node {:?}", node_id);
+                }
             }
         } else {
             self.adjacency.insert(node_id, vec![neighbor_id]);
         }
 
         if self.adjacency.contains_key(&neighbor_id) {
-            if (!self
-                .adjacency
-                .get_mut(&neighbor_id)
-                .unwrap()
-                .contains(&node_id))
-            {
-                self.adjacency.get_mut(&neighbor_id).unwrap().push(node_id);
+            match self.adjacency.get_mut(&neighbor_id) {
+                Some(neighbors) => {
+                    if !neighbors.contains(&node_id) {
+                        neighbors.push(node_id);
+                    }
+                }
+                None => {
+                    println!("Error getting neighbors for node {:?}", neighbor_id);
+                }
             }
         } else {
             self.adjacency.insert(neighbor_id, vec![node_id]);
@@ -171,29 +178,43 @@ where
     }
 }
 
-fn generate_embedding(document_content: &str) -> Result<Vec<f32>, anyhow::Error> {
-    // Call to external API to generate embedding
-    let model = TextEmbedding::try_new(InitOptions {
-        model_name: EmbeddingModel::AllMiniLML6V2,
-        show_download_progress: true,
-        ..Default::default()
-    })?;
-
-    let embedding = model.embed(vec![document_content], None)?;
-
-    Ok(embedding[0].clone())
+pub trait Embeddable {
+    fn generate_embedding(&self) -> Result<Vec<Vec<f32>>>;
 }
 
-fn generate_embeddings(document_strings: Vec<String>) -> Result<Vec<Vec<f32>>, anyhow::Error> {
-    // Call to external API to generate embedding
-    let model = TextEmbedding::try_new(InitOptions {
-        model_name: EmbeddingModel::AllMiniLML6V2,
-        show_download_progress: true,
-        ..Default::default()
-    })?;
+impl Embeddable for str {
+    fn generate_embedding(&self) -> Result<Vec<Vec<f32>>> {
+        let model = TextEmbedding::try_new(InitOptions {
+            model_name: EmbeddingModel::AllMiniLML6V2,
+            show_download_progress: true,
+            ..Default::default()
+        })?;
 
-    let embedding = model.embed(document_strings, None)?;
-    Ok(embedding.clone())
+        let embedding = model.embed(vec![self], None)?;
+
+        Ok(embedding.clone())
+    }
+}
+/// Implementing the trait for the `String` type.
+impl Embeddable for String {
+    fn generate_embedding(&self) -> Result<Vec<Vec<f32>>> {
+        self.as_str().generate_embedding()
+    }
+}
+
+/// Implementing the trait for a vector of Strings
+impl Embeddable for Vec<String> {
+    fn generate_embedding(&self) -> Result<Vec<Vec<f32>>> {
+        let model = TextEmbedding::try_new(InitOptions {
+            model_name: EmbeddingModel::AllMiniLML6V2,
+            show_download_progress: true,
+            ..Default::default()
+        })?;
+
+        let embedding = model.embed(self.to_vec(), None)?;
+
+        Ok(embedding.clone())
+    }
 }
 
 impl Database {
@@ -275,11 +296,15 @@ impl Database {
             l = self.num_layers - 1;
 
             // make it the entrypoint
-            let top_layer = self.graph_layers.get_mut(l).unwrap();
-            match top_layer.set_entry_node(doc_id) {
-                Ok(_) => (),
-                Err(e) => println!("Error setting: {}", e),
-            };
+            match self.graph_layers.get_mut(l) {
+                Some(top_layer) => {
+                    match top_layer.set_entry_node(doc_id) {
+                        Ok(_) => (),
+                        Err(e) => println!("Error setting: {}", e),
+                    };
+                }
+                None => println!("Error getting top layer"),
+            }
         }
         println!("node will be inserted at layer {:?}", l);
 
@@ -343,12 +368,12 @@ impl Database {
 
     fn search(&mut self, query: &str, top_k: usize) -> Option<Vec<&Document>> {
         println!("Query is {:?}", query);
-        let query_embedding_result = generate_embedding(query);
+        let query_embedding_result = query.generate_embedding();
         let mut query_embedding: Vec<f32> = Vec::new();
 
         match query_embedding_result {
             Ok(ref embedding) => {
-                query_embedding = embedding.clone();
+                query_embedding = embedding[0].clone();
                 // Do something with the similarity
             }
             Err(e) => {
@@ -370,8 +395,13 @@ impl Database {
 
         for curr_layer in (0..self.num_layers).rev() {
             println!("Currently at layer {:?}", curr_layer);
-            let curr_graph = self.graph_layers.get(curr_layer).unwrap();
-
+            let curr_graph = match self.graph_layers.get(curr_layer) {
+                Some(graph) => graph,
+                None => {
+                    println!("Error getting graph at layer {:?}", curr_layer);
+                    continue;
+                }
+            };
             if let Some(entry) = curr_graph.entry {
                 curr_entry_node = entry;
             }
@@ -384,8 +414,6 @@ impl Database {
                 .unwrap()
                 .embedding
                 .similarity(&query_embedding);
-
-            // changed code here:
             if !visited_docs.contains(&curr_node) {
                 if closest_docs.len() >= top_k {
                     closest_docs.pop();
@@ -419,7 +447,6 @@ impl Database {
                             closest_docs.push((MinNonNan(similarity), *doc_id));
                             visited_docs.insert(*doc_id);
                         }
-
                         (doc_id, similarity)
                     })
                     .collect();
@@ -500,7 +527,7 @@ async fn main() -> std::io::Result<()> {
 
 // Batching process
 async fn batch_process(data: web::Data<AppState>) {
-    let mut interval = interval(Duration::from_secs(1));
+    let mut interval = interval(Duration::from_millis(500));
 
     loop {
         interval.tick().await;
@@ -518,7 +545,7 @@ async fn batch_process(data: web::Data<AppState>) {
         }
 
         if !documents.is_empty() {
-            match generate_embeddings(documents.clone()) {
+            match documents.clone().generate_embedding() {
                 Ok(embeddings) => {
                     for (embedding, content) in embeddings.into_iter().zip(documents) {
                         let doc_id = data
@@ -549,14 +576,20 @@ async fn upload_document_old(
     json: web::Json<UploadQuery>,
 ) -> impl Responder {
     println!("got upload_document");
-    let mut db = data.database.lock().unwrap(); // Accessing the database safely
-                                                // Assume generate_embedding is synchronous just for placeholder; you'd use .await for async
-    let json_embedding = generate_embedding(&json.content);
+
+    let mut db = match data.database.lock() {
+        Ok(db) => db,
+        Err(poisoned) => {
+            println!("Error getting lock: {:?}", poisoned);
+            return HttpResponse::InternalServerError().finish();
+        }
+    }; // Assume generate_embedding is synchronous just for placeholder; you'd use .await for async
+    let json_embedding = json.content.generate_embedding();
     let mut content_embedding: Vec<f32> = Vec::new();
 
     match json_embedding {
         Ok(ref embedding) => {
-            content_embedding = embedding.clone();
+            content_embedding = embedding[0].clone();
         }
         Err(e) => {
             // Handle the error, e.g., logging or setting a default value
@@ -587,7 +620,13 @@ async fn search_document(
     data: web::Data<AppState>,
     json: web::Json<SearchQuery>,
 ) -> impl Responder {
-    let mut db = data.database.lock().unwrap();
+    let mut db = match data.database.lock() {
+        Ok(db) => db,
+        Err(poisoned) => {
+            println!("Error getting lock: {:?}", poisoned);
+            return HttpResponse::InternalServerError().finish();
+        }
+    };
     if let Some(doc_list) = db.search(&json.query.clone(), json.top_k.clone()) {
         // HttpResponse::Ok().json(json! ({"id": doc.id, "content": doc.content}))
         HttpResponse::Ok().json(doc_vec_to_json(doc_list))
