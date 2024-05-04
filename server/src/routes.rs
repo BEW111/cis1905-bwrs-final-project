@@ -23,14 +23,19 @@ pub async fn upload_document(params: web::Json<UploadParams>) -> impl Responder 
     println!("IN upload_document");
     match upload(params.content.clone()).await {
         Ok(recipe) => HttpResponse::Ok().json(recipe),
-        Err(_) => HttpResponse::InternalServerError().finish(),
+        Err(e) => {
+            print!("Error in upload_document: {:?}", e);
+            HttpResponse::InternalServerError().finish()
+        }
     }
 }
 
-pub async fn search_documents(params: web::Query<QueryParams>) -> HttpResponse {
-    let inner_params = params.into_inner();
-    match search(inner_params.query, inner_params.top_k).await {
+pub async fn search_documents(params: web::Json<QueryParams>) -> HttpResponse {
+    match search(params.query.clone(), params.top_k).await {
         Ok(recipes) => HttpResponse::Ok().json(recipes),
-        Err(_) => HttpResponse::InternalServerError().finish(),
+        Err(e) => {
+            print!("Error in search: {:?}", e);
+            HttpResponse::InternalServerError().finish()
+        }
     }
 }

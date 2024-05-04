@@ -1,3 +1,0 @@
-[dependencies]
-actix-web = "4"
-actix-rt = "2"

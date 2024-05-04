@@ -5,16 +5,39 @@ use num_traits::{Float, Num, NumCast};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, map::Map, Value};
 
+use std::cmp::Ordering;
 use std::ops::{Add, Mul};
 use std::sync::Mutex;
 
 use std::collections::hash_map::Entry;
+use std::collections::BinaryHeap;
 use std::collections::HashMap;
+use std::collections::HashSet;
 
 use rand::prelude::*;
 use rand_distr::Uniform;
 use std::f64::consts::E;
 
+// for a binary heap with floats
+// https://stackoverflow.com/questions/39949939/how-can-i-implement-a-min-heap-of-f64-with-rusts-binaryheap
+#[derive(PartialEq)]
+struct MinNonNan(f32);
+
+impl Eq for MinNonNan {}
+
+impl PartialOrd for MinNonNan {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        other.0.partial_cmp(&self.0)
+    }
+}
+
+impl Ord for MinNonNan {
+    fn cmp(&self, other: &MinNonNan) -> Ordering {
+        self.partial_cmp(other).unwrap()
+    }
+}
+
+// graph data structure
 #[derive(Clone)]
 struct GraphLayer {
     pub entry: Option<u32>,
@@ -312,7 +335,7 @@ impl Database {
         self.next_id - 1
     }
 
-    fn search(&mut self, query: &str, top_k: usize) -> Option<&Document> {
+    fn search(&mut self, query: &str, top_k: usize) -> Option<Vec<&Document>> {
         println!("Query is {:?}", query);
         let query_embedding_result = generate_embedding(query);
         let mut query_embedding: Vec<f32> = Vec::new();
@@ -335,6 +358,10 @@ impl Database {
         let mut curr_entry_node: u32 = u32::MAX;
         let mut curr_node: u32 = u32::MAX;
 
+        // for keeping track of the most similar nodes
+        let mut closest_docs = BinaryHeap::new(); // (similarity, doc_id)
+        let mut visited_docs = HashSet::new();
+
         for curr_layer in (0..self.num_layers).rev() {
             println!("Currently at layer {:?}", curr_layer);
             let curr_graph = self.graph_layers.get(curr_layer).unwrap();
@@ -345,7 +372,14 @@ impl Database {
 
             curr_node = curr_entry_node;
             println!("Starting search at node {:?}", curr_node);
-            let mut best_similarity: f32 = 0.0_f32;
+            let mut best_similarity: f32 = self
+                .documents
+                .get(&curr_node)
+                .unwrap()
+                .embedding
+                .similarity(&query_embedding);
+            closest_docs.push((MinNonNan(best_similarity), curr_node));
+            visited_docs.insert(curr_node);
 
             loop {
                 // 1. get all neighbors of this current node
@@ -363,6 +397,15 @@ impl Database {
                             "Similarity between query and doc {:?} is {:?}",
                             doc.content, similarity
                         );
+
+                        // keep track of the closest nodes
+                        if (!visited_docs.contains(doc_id)) {
+                            if (closest_docs.len() > top_k) {
+                                closest_docs.pop();
+                            }
+                            closest_docs.push((MinNonNan(similarity), *doc_id));
+                        }
+
                         (doc_id, similarity)
                     })
                     .collect();
@@ -400,7 +443,11 @@ impl Database {
 
         // at this point, we're at some current node with the document id we want,
         // so we can simply return the corresponding document
-        self.documents.get(&curr_node)
+        let closest_docs_vec: Vec<&Document> = closest_docs
+            .into_iter()
+            .map(|t| self.documents.get(&t.1).unwrap())
+            .collect();
+        Some(closest_docs_vec)
     }
 }
 
@@ -433,16 +480,6 @@ async fn upload_document(
                                        // Assume generate_embedding is synchronous just for placeholder; you'd use .await for async
     let json_embedding = generate_embedding(&json.content);
     let mut content_embedding: Vec<f32> = Vec::new();
-
-    // let mut doc_id = 0;
-    // if let Ok(embedding) = generate_embedding(&json.content) {
-    //     println!("Embedding generated successfully");
-    //     doc_id = db.insert(json.content.clone(), embedding);
-    //     // Further processing
-    // } else {
-    //     // Log error or handle it appropriately
-    //     println!("Failed to generate embedding");
-    // }
 
     match json_embedding {
         Ok(ref embedding) => {
@@ -478,8 +515,9 @@ async fn search_document(
     json: web::Json<SearchQuery>,
 ) -> impl Responder {
     let mut db = data.lock().unwrap();
-    if let Some(doc) = db.search(&json.query.clone(), json.top_k.clone()) {
-        HttpResponse::Ok().json(json! ({"id": doc.id, "content": doc.content}))
+    if let Some(doc_list) = db.search(&json.query.clone(), json.top_k.clone()) {
+        // HttpResponse::Ok().json(json! ({"id": doc.id, "content": doc.content}))
+        HttpResponse::Ok().json(doc_vec_to_json(doc_list))
     } else {
         HttpResponse::NotFound().finish()
     }
