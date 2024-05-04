@@ -5,14 +5,17 @@ use num_traits::{Float, Num, NumCast};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, map::Map, Value};
 
+use actix_rt::time::interval;
+use std::time::Duration;
+
 use std::cmp::Ordering;
 use std::ops::{Add, Mul};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use std::collections::hash_map::Entry;
-use std::collections::BinaryHeap;
 use std::collections::HashMap;
 use std::collections::HashSet;
+use std::collections::{BinaryHeap, VecDeque};
 
 use rand::prelude::*;
 use rand_distr::Uniform;
@@ -168,15 +171,6 @@ where
     }
 }
 
-// Calculates the cosine similarity between two vectors
-// TODO: make this into a trait
-fn cosine_similarity(a: &Vec<f32>, b: &Vec<f32>) -> f32 {
-    let dot_product: f32 = a.iter().zip(b.iter()).map(|(x, y)| x * y).sum();
-    let norm_a: f32 = a.iter().map(|x| x.powi(2)).sum::<f32>().sqrt();
-    let norm_b: f32 = b.iter().map(|x| x.powi(2)).sum::<f32>().sqrt();
-    dot_product / (norm_a * norm_b)
-}
-
 fn generate_embedding(document_content: &str) -> Result<Vec<f32>, anyhow::Error> {
     // Call to external API to generate embedding
     let model = TextEmbedding::try_new(InitOptions {
@@ -188,6 +182,18 @@ fn generate_embedding(document_content: &str) -> Result<Vec<f32>, anyhow::Error>
     let embedding = model.embed(vec![document_content], None)?;
 
     Ok(embedding[0].clone())
+}
+
+fn generate_embeddings(document_strings: Vec<String>) -> Result<Vec<Vec<f32>>, anyhow::Error> {
+    // Call to external API to generate embedding
+    let model = TextEmbedding::try_new(InitOptions {
+        model_name: EmbeddingModel::AllMiniLML6V2,
+        show_download_progress: true,
+        ..Default::default()
+    })?;
+
+    let embedding = model.embed(document_strings, None)?;
+    Ok(embedding.clone())
 }
 
 impl Database {
@@ -378,8 +384,15 @@ impl Database {
                 .unwrap()
                 .embedding
                 .similarity(&query_embedding);
-            closest_docs.push((MinNonNan(best_similarity), curr_node));
-            visited_docs.insert(curr_node);
+
+            // changed code here:
+            if !visited_docs.contains(&curr_node) {
+                if closest_docs.len() >= top_k {
+                    closest_docs.pop();
+                }
+                closest_docs.push((MinNonNan(best_similarity), curr_node));
+                visited_docs.insert(curr_node);
+            }
 
             loop {
                 // 1. get all neighbors of this current node
@@ -399,11 +412,12 @@ impl Database {
                         );
 
                         // keep track of the closest nodes
-                        if (!visited_docs.contains(doc_id)) {
-                            if (closest_docs.len() > top_k) {
+                        if !visited_docs.contains(doc_id) {
+                            if closest_docs.len() >= top_k {
                                 closest_docs.pop();
                             }
                             closest_docs.push((MinNonNan(similarity), *doc_id));
+                            visited_docs.insert(*doc_id);
                         }
 
                         (doc_id, similarity)
@@ -451,14 +465,32 @@ impl Database {
     }
 }
 
+struct AppState {
+    database: Mutex<Database>,
+    upload_queue: Mutex<VecDeque<String>>,
+}
+
 #[actix_web::main]
 async fn main() -> std::io::Result<()> {
-    let data = web::Data::new(Mutex::new(Database::new(4)));
+    // We want data to be shared state between threads, so create it outside HttpServer
+    let data = web::Data::new({
+        AppState {
+            database: Mutex::new(Database::new(4)),
+            upload_queue: Mutex::new(VecDeque::new()),
+        }
+    });
+
+    // Spawn a future
+    let data_clone = data.clone();
+    actix_rt::spawn(async move {
+        batch_process(data_clone).await;
+    });
+
     HttpServer::new(move || {
         App::new()
             .app_data(data.clone())
-            .service(hello)
             .route("/upload", web::post().to(upload_document))
+            .route("/upload_old", web::post().to(upload_document_old))
             .route("/search", web::post().to(search_document))
     })
     .bind("127.0.0.1:8080")?
@@ -466,18 +498,59 @@ async fn main() -> std::io::Result<()> {
     .await
 }
 
-#[get("/")]
-async fn hello() -> impl Responder {
-    HttpResponse::Ok().body("Hello world!")
+// Batching process
+async fn batch_process(data: web::Data<AppState>) {
+    let mut interval = interval(Duration::from_secs(1));
+
+    loop {
+        interval.tick().await;
+        let mut documents = Vec::new();
+
+        {
+            let mut queue = data.upload_queue.lock().unwrap();
+            if queue.is_empty() {
+                continue;
+            }
+
+            while let Some(doc) = queue.pop_front() {
+                documents.push(doc);
+            }
+        }
+
+        if !documents.is_empty() {
+            match generate_embeddings(documents.clone()) {
+                Ok(embeddings) => {
+                    for (embedding, content) in embeddings.into_iter().zip(documents) {
+                        let doc_id = data
+                            .database
+                            .lock()
+                            .unwrap()
+                            .insert(content.to_string(), embedding);
+                        println!("Document inserted with id: {}", doc_id);
+                    }
+                }
+                Err(_) => (),
+            }
+        }
+    }
 }
 
 async fn upload_document(
-    data: web::Data<Mutex<Database>>,
+    data: web::Data<AppState>,
+    json: web::Json<UploadQuery>,
+) -> impl Responder {
+    let mut queue = data.upload_queue.lock().unwrap();
+    queue.push_back(json.content.clone());
+    HttpResponse::Accepted().json("Document received and will be processed.")
+}
+
+async fn upload_document_old(
+    data: web::Data<AppState>,
     json: web::Json<UploadQuery>,
 ) -> impl Responder {
     println!("got upload_document");
-    let mut db = data.lock().unwrap(); // Accessing the database safely
-                                       // Assume generate_embedding is synchronous just for placeholder; you'd use .await for async
+    let mut db = data.database.lock().unwrap(); // Accessing the database safely
+                                                // Assume generate_embedding is synchronous just for placeholder; you'd use .await for async
     let json_embedding = generate_embedding(&json.content);
     let mut content_embedding: Vec<f32> = Vec::new();
 
@@ -511,10 +584,10 @@ fn doc_vec_to_json(doc_list: Vec<&Document>) -> Value {
 }
 
 async fn search_document(
-    data: web::Data<Mutex<Database>>,
+    data: web::Data<AppState>,
     json: web::Json<SearchQuery>,
 ) -> impl Responder {
-    let mut db = data.lock().unwrap();
+    let mut db = data.database.lock().unwrap();
     if let Some(doc_list) = db.search(&json.query.clone(), json.top_k.clone()) {
         // HttpResponse::Ok().json(json! ({"id": doc.id, "content": doc.content}))
         HttpResponse::Ok().json(doc_vec_to_json(doc_list))
