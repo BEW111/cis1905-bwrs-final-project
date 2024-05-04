@@ -33,7 +33,10 @@ impl PartialOrd for MinNonNan {
 
 impl Ord for MinNonNan {
     fn cmp(&self, other: &MinNonNan) -> Ordering {
-        self.partial_cmp(other).unwrap()
+        match self.partial_cmp(other) {
+            Some(ord) => ord,
+            None => Ordering::Less,
+        }
     }
 }
 
@@ -69,26 +72,30 @@ impl GraphLayer {
 
     pub fn add_neighbor(&mut self, node_id: u32, neighbor_id: u32) -> Result<()> {
         if self.adjacency.contains_key(&node_id) {
-            if !self
-                .adjacency
-                .get_mut(&node_id)
-                .unwrap()
-                .contains(&neighbor_id)
-            {
-                self.adjacency.get_mut(&node_id).unwrap().push(neighbor_id);
+            match self.adjacency.get_mut(&node_id) {
+                Some(neighbors) => {
+                    if !neighbors.contains(&neighbor_id) {
+                        neighbors.push(neighbor_id);
+                    }
+                }
+                None => {
+                    println!("Error getting neighbors for node {:?}", node_id);
+                }
             }
         } else {
             self.adjacency.insert(node_id, vec![neighbor_id]);
         }
 
         if self.adjacency.contains_key(&neighbor_id) {
-            if (!self
-                .adjacency
-                .get_mut(&neighbor_id)
-                .unwrap()
-                .contains(&node_id))
-            {
-                self.adjacency.get_mut(&neighbor_id).unwrap().push(node_id);
+            match self.adjacency.get_mut(&neighbor_id) {
+                Some(neighbors) => {
+                    if !neighbors.contains(&node_id) {
+                        neighbors.push(node_id);
+                    }
+                }
+                None => {
+                    println!("Error getting neighbors for node {:?}", neighbor_id);
+                }
             }
         } else {
             self.adjacency.insert(neighbor_id, vec![node_id]);
@@ -168,6 +175,30 @@ where
     }
 }
 
+pub trait Embeddable {
+    fn generate_embedding(&self) -> Result<Vec<f32>>;
+}
+
+impl Embeddable for str {
+    fn generate_embedding(&self) -> Result<Vec<f32>> {
+        let model = TextEmbedding::try_new(InitOptions {
+            model_name: EmbeddingModel::AllMiniLML6V2,
+            show_download_progress: true,
+            ..Default::default()
+        })?;
+
+        let embedding = model.embed(vec![self], None)?;
+
+        Ok(embedding[0].clone())
+    }
+}
+/// Implementing the trait for the `String` type.
+impl Embeddable for String {
+    fn generate_embedding(&self) -> Result<Vec<f32>> {
+        self.as_str().generate_embedding()
+    }
+}
+
 // Calculates the cosine similarity between two vectors
 // TODO: make this into a trait
 fn cosine_similarity(a: &Vec<f32>, b: &Vec<f32>) -> f32 {
@@ -177,18 +208,18 @@ fn cosine_similarity(a: &Vec<f32>, b: &Vec<f32>) -> f32 {
     dot_product / (norm_a * norm_b)
 }
 
-fn generate_embedding(document_content: &str) -> Result<Vec<f32>, anyhow::Error> {
-    // Call to external API to generate embedding
-    let model = TextEmbedding::try_new(InitOptions {
-        model_name: EmbeddingModel::AllMiniLML6V2,
-        show_download_progress: true,
-        ..Default::default()
-    })?;
+// fn generate_embedding(document_content: &str) -> Result<Vec<f32>, anyhow::Error> {
+//     // Call to external API to generate embedding
+//     let model = TextEmbedding::try_new(InitOptions {
+//         model_name: EmbeddingModel::AllMiniLML6V2,
+//         show_download_progress: true,
+//         ..Default::default()
+//     })?;
 
-    let embedding = model.embed(vec![document_content], None)?;
+//     let embedding = model.embed(vec![document_content], None)?;
 
-    Ok(embedding[0].clone())
-}
+//     Ok(embedding[0].clone())
+// }
 
 impl Database {
     fn new(num_layers: usize) -> Self {
@@ -269,11 +300,15 @@ impl Database {
             l = self.num_layers - 1;
 
             // make it the entrypoint
-            let top_layer = self.graph_layers.get_mut(l).unwrap();
-            match top_layer.set_entry_node(doc_id) {
-                Ok(_) => (),
-                Err(e) => println!("Error setting: {}", e),
-            };
+            match self.graph_layers.get_mut(l) {
+                Some(top_layer) => {
+                    match top_layer.set_entry_node(doc_id) {
+                        Ok(_) => (),
+                        Err(e) => println!("Error setting: {}", e),
+                    };
+                }
+                None => println!("Error getting top layer"),
+            }
         }
         println!("node will be inserted at layer {:?}", l);
 
@@ -337,7 +372,7 @@ impl Database {
 
     fn search(&mut self, query: &str, top_k: usize) -> Option<Vec<&Document>> {
         println!("Query is {:?}", query);
-        let query_embedding_result = generate_embedding(query);
+        let query_embedding_result = query.generate_embedding();
         let mut query_embedding: Vec<f32> = Vec::new();
 
         match query_embedding_result {
@@ -364,8 +399,13 @@ impl Database {
 
         for curr_layer in (0..self.num_layers).rev() {
             println!("Currently at layer {:?}", curr_layer);
-            let curr_graph = self.graph_layers.get(curr_layer).unwrap();
-
+            let curr_graph = match self.graph_layers.get(curr_layer) {
+                Some(graph) => graph,
+                None => {
+                    println!("Error getting graph at layer {:?}", curr_layer);
+                    continue;
+                }
+            };
             if let Some(entry) = curr_graph.entry {
                 curr_entry_node = entry;
             }
@@ -378,8 +418,13 @@ impl Database {
                 .unwrap()
                 .embedding
                 .similarity(&query_embedding);
-            closest_docs.push((MinNonNan(best_similarity), curr_node));
-            visited_docs.insert(curr_node);
+            if !visited_docs.contains(&curr_node) {
+                if closest_docs.len() >= top_k {
+                    closest_docs.pop();
+                }
+                closest_docs.push((MinNonNan(best_similarity), curr_node));
+                visited_docs.insert(curr_node);
+            }
 
             loop {
                 // 1. get all neighbors of this current node
@@ -399,13 +444,13 @@ impl Database {
                         );
 
                         // keep track of the closest nodes
-                        if (!visited_docs.contains(doc_id)) {
-                            if (closest_docs.len() > top_k) {
+                        if !visited_docs.contains(doc_id) {
+                            if closest_docs.len() >= top_k {
                                 closest_docs.pop();
                             }
                             closest_docs.push((MinNonNan(similarity), *doc_id));
+                            visited_docs.insert(*doc_id);
                         }
-
                         (doc_id, similarity)
                     })
                     .collect();
@@ -476,9 +521,15 @@ async fn upload_document(
     json: web::Json<UploadQuery>,
 ) -> impl Responder {
     println!("got upload_document");
-    let mut db = data.lock().unwrap(); // Accessing the database safely
-                                       // Assume generate_embedding is synchronous just for placeholder; you'd use .await for async
-    let json_embedding = generate_embedding(&json.content);
+
+    let mut db = match data.lock() {
+        Ok(db) => db,
+        Err(poisoned) => {
+            println!("Error getting lock: {:?}", poisoned);
+            return HttpResponse::InternalServerError().finish();
+        }
+    }; // Assume generate_embedding is synchronous just for placeholder; you'd use .await for async
+    let json_embedding = json.content.generate_embedding();
     let mut content_embedding: Vec<f32> = Vec::new();
 
     match json_embedding {
@@ -514,7 +565,13 @@ async fn search_document(
     data: web::Data<Mutex<Database>>,
     json: web::Json<SearchQuery>,
 ) -> impl Responder {
-    let mut db = data.lock().unwrap();
+    let mut db = match data.lock() {
+        Ok(db) => db,
+        Err(poisoned) => {
+            println!("Error getting lock: {:?}", poisoned);
+            return HttpResponse::InternalServerError().finish();
+        }
+    };
     if let Some(doc_list) = db.search(&json.query.clone(), json.top_k.clone()) {
         // HttpResponse::Ok().json(json! ({"id": doc.id, "content": doc.content}))
         HttpResponse::Ok().json(doc_vec_to_json(doc_list))

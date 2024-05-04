@@ -18,6 +18,7 @@ async fn main() -> std::io::Result<()> {
                 web::post().to(routes::search_documents),
             )
     })
+    .workers(4)
     .bind("127.0.0.1:3535")?
     .run()
     .await

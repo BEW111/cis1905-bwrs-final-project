@@ -1,6 +1,5 @@
 // src/routes.rs
 use crate::services::{search, upload};
-use actix_web::web::Query;
 use actix_web::Responder;
 use actix_web::{web, HttpResponse};
 use serde::Deserialize;

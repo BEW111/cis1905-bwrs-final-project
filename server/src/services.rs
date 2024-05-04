@@ -14,10 +14,10 @@ pub struct UploadResponse {
 }
 #[derive(Deserialize, Serialize, Debug)]
 pub struct SearchResponse {
-    result_1: String,
-    result_2: String,
-    result_3: String,
-    result_4: String,
+    result1: String,
+    result2: String,
+    result3: String,
+    result4: String,
 }
 
 pub async fn upload(content: String) -> Result<UploadResponse, reqwest::Error> {
@@ -34,7 +34,7 @@ pub async fn upload(content: String) -> Result<UploadResponse, reqwest::Error> {
     Ok(result)
 }
 
-pub async fn search(query: String, top_k: usize) -> Result<SearchResponse, reqwest::Error> {
+pub async fn search(query: String, top_k: usize) -> Result<String, reqwest::Error> {
     let url = format!("{}/search", DB_URL);
     let body = json!({
         "query": query,
@@ -42,13 +42,13 @@ pub async fn search(query: String, top_k: usize) -> Result<SearchResponse, reqwe
     });
 
     let response = CLIENT.post(url).json(&body).send().await?;
-    //let text = response.text().await?;
 
-    // println!("text: {:?}", text);
+    let text = response.text().await?;
+    Ok(text)
 
-    let result: SearchResponse = response.json().await?;
-    //let json_string = serde_json::to_string(&result);
-    Ok(result)
+    // let result: SearchResponse = response.json().await?;
+    // //let json_string = serde_json::to_string(&result);
+    // Ok(result)
 
     // Ok(result)
 }
